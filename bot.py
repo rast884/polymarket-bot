@@ -1,6 +1,8 @@
 """
-BTC 5MIN Polymarket Bot — без py-clob-client
-Работает напрямую через Polymarket HTTP API
+BTC 5MIN Polymarket Bot v3
+- Не работает в выходные (сб, вс)
+- Не работает с 00:00 до 9:00 МСК (= до 6:00 UTC)
+- Размер ставки через переменную BET_USD
 """
 
 import os, time, json, logging, asyncio, hmac, hashlib, base64
@@ -33,8 +35,8 @@ MIN_SCORE          = float(os.getenv("MIN_SCORE",      "3.5"))
 WIN_MULT           = float(os.getenv("WIN_MULT",       "0.9"))
 START_BALANCE      = float(os.getenv("START_BALANCE",  "100.0"))
 
-ROUND_SEC = 300
-TICK_SEC  = 5
+ROUND_SEC  = 300
+TICK_SEC   = 5
 CLOB_HOST  = "https://clob.polymarket.com"
 GAMMA_HOST = "https://gamma-api.polymarket.com"
 
@@ -82,13 +84,36 @@ def load_state():
     except FileNotFoundError:
         log.info("Starting fresh")
 
+def is_trading_time() -> tuple:
+    """
+    Возвращает (можно_торговать, причина_паузы)
+    Торгуем только: пн-пт, 09:00-00:00 МСК (= 06:00-21:00 UTC)
+    """
+    now     = datetime.utcnow()
+    weekday = now.weekday()   # 0=пн .. 4=пт, 5=сб, 6=вс
+    hour    = now.hour
+
+    if weekday >= 5:
+        day_name = "Суббота" if weekday == 5 else "Воскресенье"
+        return False, f"{day_name} — бот не работает в выходные"
+
+    # 9:00 МСК = 06:00 UTC, 00:00 МСК = 21:00 UTC
+    if hour < 6:
+        msk_hour = hour + 3
+        return False, f"Ночь МСК {msk_hour:02d}:xx — бот работает с 09:00 МСК"
+
+    if hour >= 21:
+        return False, f"Поздний вечер UTC {hour}:xx — бот работает до 00:00 МСК"
+
+    return True, ""
+
 def make_auth_headers(method, path, body=""):
     timestamp = str(int(time.time()))
     message   = timestamp + method.upper() + path + body
     try:
-        secret  = base64.b64decode(API_SECRET + "==")
+        secret = base64.b64decode(API_SECRET + "==")
     except Exception:
-        secret  = API_SECRET.encode()
+        secret = API_SECRET.encode()
     signature = hmac.new(secret, message.encode(), hashlib.sha256).digest()
     sig_b64   = base64.b64encode(signature).decode()
     return {
@@ -121,7 +146,8 @@ async def get_klines(limit=10):
             r = await client.get("https://api.bybit.com/v5/market/kline",
                 params={"category": "spot", "symbol": "BTCUSDT", "interval": "1", "limit": limit})
             data = r.json()["result"]["list"]
-            return [{"o": float(k[1]), "h": float(k[2]), "l": float(k[3]), "c": float(k[4]), "v": float(k[5])} for k in reversed(data)]
+            return [{"o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                     "c": float(k[4]), "v": float(k[5])} for k in reversed(data)]
         except Exception as e:
             log.warning(f"Klines error: {e}")
     return []
@@ -151,10 +177,10 @@ async def find_market():
         try:
             r = await client.get(f"{GAMMA_HOST}/markets",
                 params={"q": "BTC UP DOWN 5 minutes", "active": "true", "limit": 3})
-            resp = r.json()
+            resp    = r.json()
             markets = resp if isinstance(resp, list) else resp.get("markets", [])
             if markets:
-                m = markets[0]
+                m      = markets[0]
                 prices = m.get("outcomePrices", "[0.5,0.5]")
                 if isinstance(prices, str):
                     prices = json.loads(prices)
@@ -218,26 +244,32 @@ def ai_signal(klines, pm_up=0.5, pm_down=0.5):
     v = [k["v"] for k in klines]
     score = 0.0; sigs = []
 
+    # 1. Тренд
     rA = (c[-1]+c[-2]+c[-3])/3; eA = (c[0]+c[1]+c[2])/3
     if   rA > eA*1.001: score += 2.5; sigs.append("TrendUP")
     elif rA < eA*0.999: score -= 2.5; sigs.append("TrendDN")
 
+    # 2. Тело свечи
     lb = c[-1]-o[-1]; lr = h[-1]-l[-1]; br = abs(lb)/lr if lr > 0 else 0
     if   lb > 0 and br > 0.6: score += 2.0; sigs.append("BullCandle")
     elif lb < 0 and br > 0.6: score -= 2.0; sigs.append("BearCandle")
 
+    # 3. Моментум
     bR  = sum(1 for i in range(n-3,n) if c[i]>o[i])
     beR = sum(1 for i in range(n-3,n) if c[i]<o[i])
     if bR  == 3: score += 2.5; sigs.append("3xBull")
     if beR == 3: score -= 2.5; sigs.append("3xBear")
 
+    # 4. Объём
     avg_v = sum(v[:-1])/(n-1) if n>1 else 1
     if v[-1] > avg_v*1.5:
-        score += 1.5 if lb>0 else -1.5
+        score += 1.5 if lb>0 else -1.5; sigs.append(f"Vol{v[-1]/avg_v:.1f}x")
 
+    # 5. Разворот
     ranges = [h[i]-l[i] for i in range(n)]; avg_r = sum(ranges)/n
     if lr > avg_r*2.5: score *= 0.3; sigs.append("Reversal")
 
+    # 6. RSI
     gains  = [c[i]-c[i-1] for i in range(1,n) if c[i]>c[i-1]]
     losses = [abs(c[i]-c[i-1]) for i in range(1,n) if c[i]<c[i-1]]
     aG = sum(gains)/len(gains) if gains else 0
@@ -245,28 +277,37 @@ def ai_signal(klines, pm_up=0.5, pm_down=0.5):
     rsi = 100 - 100/(1+aG/aL)
     if   rsi > 72: score -= 2.0; sigs.append(f"RSI{rsi:.0f}OB")
     elif rsi < 28: score += 2.0; sigs.append(f"RSI{rsi:.0f}OS")
+    else:                         sigs.append(f"RSI{rsi:.0f}")
 
+    # 7. Polymarket sentiment
     if pm_up != 0.5:
         if   pm_up >= 0.65: score += 4.0; sigs.append(f"PM_UP{pm_up*100:.0f}")
         elif pm_up <= 0.35: score -= 4.0; sigs.append(f"PM_DN{pm_up*100:.0f}")
-        elif pm_up >= 0.57: score += 2.0
-        elif pm_up <= 0.43: score -= 2.0
-
-    hour_utc = datetime.utcnow().hour
-    if not (7 <= hour_utc <= 21):
-        score *= 0.4; sigs.append("Night")
+        elif pm_up >= 0.57: score += 2.0; sigs.append(f"PM_up{pm_up*100:.0f}")
+        elif pm_up <= 0.43: score -= 2.0; sigs.append(f"PM_dn{pm_up*100:.0f}")
 
     abs_score  = abs(score)
     skip       = abs_score < MIN_SCORE
     direction  = "UP" if score >= 0 else "DOWN"
     confidence = min(87, max(52, 52 + abs_score*4))
-    reason     = f"Score:{score:.1f} RSI:{rsi:.0f} PM:{pm_up:.2f} {' '.join(sigs)} -> {'UP' if direction=='UP' else 'DOWN'} {confidence:.0f}%{' SKIP' if skip else ''}"
+    reason     = (f"Score:{score:.1f} RSI:{rsi:.0f} PM:{pm_up:.2f} "
+                  f"{' '.join(sigs)} -> "
+                  f"{'UP' if direction=='UP' else 'DOWN'} {confidence:.0f}%"
+                  f"{' SKIP' if skip else ''}")
 
-    return {"direction": direction, "confidence": confidence, "score": score, "skip": skip, "reason": reason}
+    return {"direction": direction, "confidence": confidence,
+            "score": score, "skip": skip, "reason": reason}
 
+# ══════════════════════════════════════════
+#  ОСНОВНОЙ ЦИКЛ
+# ══════════════════════════════════════════
 async def bot_loop():
-    log.info("BTC 5MIN Polymarket Bot started!")
-    log.info(f"Bet: ${BET_USD} | Daily limit: ${MAX_DAILY_LOSS_USD} | Min score: {MIN_SCORE}")
+    log.info("=" * 55)
+    log.info("  BTC 5MIN Polymarket Bot v3")
+    log.info(f"  Ставка: ${BET_USD} | Лимит/день: ${MAX_DAILY_LOSS_USD}")
+    log.info(f"  График: Пн-Пт 09:00-00:00 МСК")
+    log.info(f"  Мин. скор: {MIN_SCORE}")
+    log.info("=" * 55)
 
     load_state()
 
@@ -274,30 +315,47 @@ async def bot_loop():
     last_market_ts = 0
     placed_round   = None
     resolved_round = None
+    last_pause_msg = ""
 
     while True:
         try:
             reset_daily()
-            rid    = round_id()
-            remain = round_remain()
 
+            # ── РАСПИСАНИЕ ─────────────────────────────────
+            can_trade, pause_reason = is_trading_time()
+            if not can_trade:
+                if pause_reason != last_pause_msg:
+                    log.info(f"⏸  {pause_reason}")
+                    last_pause_msg = pause_reason
+                await asyncio.sleep(60)
+                continue
+            else:
+                last_pause_msg = ""
+
+            # ── ЛИМИТЫ ─────────────────────────────────────
             if state["balance"] < MIN_BALANCE_USD:
-                log.warning(f"STOP: Balance ${state['balance']:.2f} < ${MIN_BALANCE_USD}")
+                log.warning(f"⛔ Баланс ${state['balance']:.2f} < ${MIN_BALANCE_USD}. Стоп.")
                 break
 
             if state["daily_loss"] >= MAX_DAILY_LOSS_USD:
-                log.warning(f"STOP: Daily limit ${MAX_DAILY_LOSS_USD} reached. Pause 5min.")
+                log.warning(f"⛔ Дневной лимит ${MAX_DAILY_LOSS_USD} исчерпан. Пауза до завтра.")
                 await asyncio.sleep(300)
                 continue
 
+            rid    = round_id()
+            remain = round_remain()
+
+            # ── ПОИСК РЫНКА ────────────────────────────────
             if time.time() - last_market_ts > 240:
                 market         = await find_market()
                 last_market_ts = time.time()
                 if market:
-                    log.info(f"Market: UP={market['up_price']:.2f} DOWN={market['dn_price']:.2f} Vol={market['volume']:.0f}")
+                    log.info(f"📊 Рынок: UP={market['up_price']:.2f} "
+                             f"DOWN={market['dn_price']:.2f} Vol={market['volume']:.0f}")
                 else:
-                    log.warning("No active BTC 5MIN market found")
+                    log.warning("⚠️  Активный BTC 5MIN рынок не найден")
 
+            # ── СТАВКА (первые 20 сек раунда) ──────────────
             if remain > ROUND_SEC - 20 and placed_round != rid:
                 klines = await get_klines()
                 price  = await get_price()
@@ -305,16 +363,18 @@ async def bot_loop():
                 pm_dn  = market["dn_price"] if market else 0.5
                 sig    = ai_signal(klines, pm_up, pm_dn)
 
-                log.info(f"=== Round {fmt_window(rid)} ===")
-                log.info(f"BTC: ${price['price']:,.0f} ({price['change']:+.2f}%) [{price['source']}]")
-                log.info(f"AI: {sig['reason']}")
+                now_msk = datetime.utcnow().hour + 3
+                log.info(f"\n{'='*55}")
+                log.info(f"⏰  Раунд {fmt_window(rid)}  |  МСК ~{now_msk:02d}:xx")
+                log.info(f"₿   BTC: ${price['price']:,.0f} ({price['change']:+.2f}%) [{price['source']}]")
+                log.info(f"🤖  {sig['reason']}")
 
                 placed_round = rid
 
                 if sig["skip"] or not market:
-                    log.info("SKIP - weak signal or no market")
+                    log.info("⏭️   Пропуск — слабый сигнал или нет рынка")
                 else:
-                    log.info(f"BET: {sig['direction']} ${BET_USD:.2f} conf={sig['confidence']:.0f}%")
+                    log.info(f"🎯  Ставим {sig['direction']} ${BET_USD:.2f} | уверенность {sig['confidence']:.0f}%")
                     ok = await place_order(market, sig["direction"], BET_USD)
                     if ok:
                         state["balance"]    -= BET_USD
@@ -326,8 +386,11 @@ async def bot_loop():
                             "start_price": price["price"],
                         }
                         save_state()
-                        log.info(f"Bet placed. Balance: ${state['balance']:.2f}")
+                        log.info(f"✅  Ставка принята. Баланс: ${state['balance']:.2f}")
+                    else:
+                        log.error("❌  Ставка не прошла")
 
+            # ── РЕЗУЛЬТАТ (последние 8 сек раунда) ─────────
             elif remain < 8 and state["pending"] and resolved_round != rid:
                 bet   = state["pending"]
                 price = await get_price()
@@ -340,13 +403,13 @@ async def bot_loop():
                     state["daily_loss"] -= bet["bet"]
                     state["pnl"]        += profit
                     state["wins"]       += 1
-                    log.info(f"WIN! +${profit:.2f} Balance: ${state['balance']:.2f}")
+                    log.info(f"🏆  ВЫИГРЫШ! +${profit:.2f} | Баланс: ${state['balance']:.2f}")
                 else:
                     state["pnl"]    -= bet["bet"]
                     state["losses"] += 1
-                    log.info(f"LOSS -${bet['bet']:.2f} Balance: ${state['balance']:.2f}")
+                    log.info(f"💸  Проигрыш -${bet['bet']:.2f} | Баланс: ${state['balance']:.2f}")
 
-                log.info(f"Stats: W={state['wins']} L={state['losses']} PnL=${state['pnl']:.2f}")
+                log.info(f"📊  Итого: Побед={state['wins']} Поражений={state['losses']} PnL=${state['pnl']:.2f}")
                 state["pending"] = None
                 resolved_round   = rid
                 save_state()
@@ -354,11 +417,11 @@ async def bot_loop():
             await asyncio.sleep(TICK_SEC)
 
         except KeyboardInterrupt:
-            log.info("Bot stopped")
+            log.info("🛑 Бот остановлен вручную")
             save_state()
             break
         except Exception as e:
-            log.error(f"Loop error: {e}")
+            log.error(f"Ошибка цикла: {e}")
             await asyncio.sleep(10)
 
 if __name__ == "__main__":
